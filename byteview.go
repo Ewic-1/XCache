@@ -1,4 +1,4 @@
-package XCache
+package xcache
 
 // ByteView 只读的字节视图，用来缓存数据
 type ByteView struct {

@@ -1,12 +1,13 @@
-package XCache
+package xcache
 
 import (
-	"XCache/store"
+	"xcache/store"
 	"context"
-	"github.com/sirupsen/logrus"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // Cache 是对底层缓存存储的封装

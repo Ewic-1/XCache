@@ -1,1 +1,4 @@
-package XCache
+package xcache
+
+type PeerPicker interface {
+}

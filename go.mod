@@ -1,4 +1,4 @@
-module XCache
+module xcache
 
 go 1.25.0
 

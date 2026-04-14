@@ -27,6 +27,7 @@ type lruEntry struct {
 
 func newLRUCache(opts Options) *lruCache {
 	c := &lruCache{
+		list:            list.New(),
 		items:           make(map[string]*list.Element),
 		expires:         make(map[string]time.Time),
 		maxBytes:        opts.MaxBytes,
@@ -58,7 +59,7 @@ func (c *lruCache) Clear() {
 	// 回调函数
 	if c.onEvicted != nil {
 		for _, e := range c.items {
-			c.onEvicted(e.Value.(*lruEntry).key, e.Value.(Value))
+			c.onEvicted(e.Value.(*lruEntry).key, e.Value.(*lruEntry).value)
 		}
 	}
 
