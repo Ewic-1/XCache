@@ -147,3 +147,109 @@ func (c *lru2Cache) Close() {
 func (c *lru2Cache) cleanupLoop() {
 
 }
+
+// 将一个节点移动到链表头
+func (c *cache) move2head(idx uint16) {
+	// 如果在链表头部则跳过
+	if c.dlnk[idx][prev] != 0 {
+		// 如果在链表中要先删除
+		c.dlnk[c.dlnk[idx][prev]][next] = c.dlnk[idx][next]
+		c.dlnk[c.dlnk[idx][next]][prev] = c.dlnk[idx][prev]
+		// 插入头部
+		c.dlnk[idx][next] = c.dlnk[0][next]
+		c.dlnk[c.dlnk[idx][next]][prev] = idx
+		c.dlnk[0][next] = idx
+		c.dlnk[idx][prev] = 0
+	}
+}
+
+func (c *cache) move2tail(idx uint16) {
+	if c.dlnk[idx][next] != 0 {
+		c.dlnk[c.dlnk[idx][prev]][next] = c.dlnk[idx][next]
+		c.dlnk[c.dlnk[idx][next]][prev] = c.dlnk[idx][prev]
+
+		c.dlnk[idx][prev] = c.dlnk[0][prev]
+		c.dlnk[c.dlnk[idx][prev]][next] = idx
+		c.dlnk[idx][next] = 0
+		c.dlnk[0][prev] = idx
+	}
+}
+
+// 遍历缓存中的所有有效项
+func (c *cache) walk(walker func(key string, value Value, expireAt int64) bool) {
+	for idx := c.dlnk[0][next]; idx != 0; idx = c.dlnk[idx][next] {
+		if c.m[idx-1].expireAt > 0 && !walker(c.m[idx-1].k, c.m[idx-1].v, c.m[idx-1].expireAt) {
+			return
+		}
+	}
+}
+
+// 向缓存中添加项，如果是新增返回 1，更新返回 0
+func (c *cache) put(k string, v Value, expireAt int64, onEvicted func(string, Value)) int {
+	// 查到已有映射则走更新逻辑
+	if idx, ok := c.hmap[k]; ok {
+		c.m[idx-1].v, c.m[idx-1].expireAt = v, expireAt
+		c.move2head(idx)
+		return 0
+	}
+	Z
+	// 如果容量已满
+	if c.last == uint16(cap(c.m)) {
+		tailIdx := c.dlnk[0][prev]
+		tail := &c.m[tailIdx-1]
+		if onEvicted != nil && tail.expireAt > 0 {
+			onEvicted(tail.k, tail.v)
+		}
+		delete(c.hmap, tail.k)
+		tail.k = k
+		tail.v = v
+		tail.expireAt = expireAt
+		c.hmap[k] = tailIdx
+		c.move2head(tailIdx)
+		return 1
+	}
+
+	// 还有空位，新增节点
+	c.last++
+	idx := c.last
+	c.m[idx-1].k = k
+	c.m[idx-1].v = v
+	c.m[idx-1].expireAt = expireAt
+	c.hmap[k] = idx
+	// 插到链表头
+	if len(c.hmap) == 1 {
+		// 第一个节点
+		c.dlnk[0][prev] = idx
+		c.dlnk[0][next] = idx
+		c.dlnk[idx][prev] = 0
+		c.dlnk[idx][next] = 0
+	} else {
+		oldHead := c.dlnk[0][next]
+		c.dlnk[idx][prev] = 0
+		c.dlnk[idx][next] = oldHead
+		c.dlnk[oldHead][prev] = idx
+		c.dlnk[0][next] = idx
+	}
+	return 1
+}
+
+// 从缓存中获取键对应的节点和状态
+func (c *cache) get(key string) (*node, int) {
+	if idx, ok := c.hmap[key]; ok {
+		c.move2head(idx)
+		return &c.m[idx-1], 1
+	}
+	return nil, 0
+}
+
+// 从缓存中删除键对应的项
+func (c *cache) del(key string) (*node, int, int64) {
+	if idx, ok := c.hmap[key]; ok && c.m[idx-1].expireAt > 0 {
+		e := c.m[idx-1].expireAt
+		c.m[idx-1].expireAt = 0 // 标记为已删除
+		c.move2tail(idx)        // 移动到链表尾部
+		return &c.m[idx-1], 1, e
+	}
+
+	return nil, 0, 0
+}
