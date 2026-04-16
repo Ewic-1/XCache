@@ -35,6 +35,7 @@ type lru2Cache struct {
 	mask          int32
 	cleanupTicker *time.Ticker
 	onEvicted     func(key string, value Value)
+	closeCh       chan struct{}
 }
 
 type cache struct {
@@ -74,6 +75,7 @@ func newLRU2Cache(opts Options) *lru2Cache {
 	if opts.CleanupInterval <= 0 {
 		opts.CleanupInterval = time.Minute
 	}
+
 	mask := maskOfNextPowOf2(opts.BucketCount)
 	c := &lru2Cache{
 		locks:         make([]sync.Mutex, mask+1),
@@ -81,6 +83,7 @@ func newLRU2Cache(opts Options) *lru2Cache {
 		onEvicted:     opts.OnEvicted,
 		cleanupTicker: time.NewTicker(opts.CleanupInterval),
 		mask:          int32(mask),
+		closeCh:       make(chan struct{}),
 	}
 
 	for i := range c.caches {
@@ -116,38 +119,6 @@ func hashBKRD(s string) (hash int32) {
 	return
 }
 
-func (c *lru2Cache) Get(key string) (Value, bool) {
-	return nil, false
-}
-
-func (c *lru2Cache) Set(key string, value Value) error {
-	return nil
-}
-
-func (c *lru2Cache) SetWithExpiration(key string, value Value, expiration time.Duration) error {
-	return nil
-}
-
-func (c *lru2Cache) Delete(key string) bool {
-	return false
-}
-
-func (c *lru2Cache) Clear() {
-
-}
-
-func (c *lru2Cache) Len() int {
-	return 0
-}
-
-func (c *lru2Cache) Close() {
-
-}
-
-func (c *lru2Cache) cleanupLoop() {
-
-}
-
 // 将一个节点移动到链表头
 func (c *cache) move2head(idx uint16) {
 	// 如果在链表头部则跳过
@@ -178,7 +149,7 @@ func (c *cache) move2tail(idx uint16) {
 // 遍历缓存中的所有有效项
 func (c *cache) walk(walker func(key string, value Value, expireAt int64) bool) {
 	for idx := c.dlnk[0][next]; idx != 0; idx = c.dlnk[idx][next] {
-		if c.m[idx-1].expireAt > 0 && !walker(c.m[idx-1].k, c.m[idx-1].v, c.m[idx-1].expireAt) {
+		if !walker(c.m[idx-1].k, c.m[idx-1].v, c.m[idx-1].expireAt) {
 			return
 		}
 	}
@@ -192,7 +163,7 @@ func (c *cache) put(k string, v Value, expireAt int64, onEvicted func(string, Va
 		c.move2head(idx)
 		return 0
 	}
-	Z
+
 	// 如果容量已满
 	if c.last == uint16(cap(c.m)) {
 		tailIdx := c.dlnk[0][prev]
@@ -244,12 +215,208 @@ func (c *cache) get(key string) (*node, int) {
 
 // 从缓存中删除键对应的项
 func (c *cache) del(key string) (*node, int, int64) {
-	if idx, ok := c.hmap[key]; ok && c.m[idx-1].expireAt > 0 {
+	if idx, ok := c.hmap[key]; ok {
 		e := c.m[idx-1].expireAt
-		c.m[idx-1].expireAt = 0 // 标记为已删除
-		c.move2tail(idx)        // 移动到链表尾部
+		c.m[idx-1].expireAt = -1 // 标记为已删除
+		c.move2tail(idx)         // 移动到链表尾部
 		return &c.m[idx-1], 1, e
 	}
 
 	return nil, 0, 0
+}
+func (c *lru2Cache) SetWithExpiration(k string, v Value, expiration time.Duration) error {
+	expireAt := int64(0)
+	if expiration > 0 {
+		expireAt = Now() + int64(expiration.Nanoseconds())
+	}
+	idx := hashBKRD(k) & c.mask
+	c.locks[idx].Lock()
+	defer c.locks[idx].Unlock()
+	// 放入一级缓存
+	c.caches[idx][0].put(k, v, expireAt, c.onEvicted)
+	return nil
+}
+
+func (c *lru2Cache) Set(k string, v Value) error {
+	return c.SetWithExpiration(k, v, 0)
+}
+
+func (c *lru2Cache) Get(k string) (Value, bool) {
+	// 计算idx，加锁等
+	idx := hashBKRD(k) & c.mask
+	c.locks[idx].Lock()
+	defer c.locks[idx].Unlock()
+	now := Now()
+	// 查一级缓存
+	if n, ok, expireAt := c.caches[idx][0].del(k); ok == 1 {
+		// 查到缓存
+		if expireAt > 0 && expireAt <= now {
+			// 过期则删除
+			c.delete(k, idx)
+			return nil, false
+		}
+
+		// 有效则移动至二级缓存
+		c.caches[idx][1].put(k, n.v, expireAt, c.onEvicted)
+		return n.v, true
+	}
+
+	// 没查到则查二级缓存
+	if n, ok := c._get(k, idx, 1); ok == 1 {
+		// 过期则删除
+		if n.expireAt > 0 && n.expireAt <= now {
+			c.caches[idx][1].del(k)
+			c.delete(k, idx)
+			return nil, false
+		}
+		return n.v, true
+	}
+	return nil, false
+}
+
+func (c *lru2Cache) _get(k string, idx int32, level int32) (*node, int) {
+	if n, st := c.caches[idx][level].get(k); st > 0 && n != nil {
+		currentTime := Now()
+		if n.expireAt == -1 {
+			return nil, 0
+		}
+		if n.expireAt > 0 && currentTime >= n.expireAt {
+			// 过期或已删除
+			return nil, 0
+		}
+		return n, st
+	}
+
+	return nil, 0
+}
+
+func (c *lru2Cache) delete(key string, idx int32) bool {
+	n1, s1, _ := c.caches[idx][0].del(key)
+	n2, s2, _ := c.caches[idx][1].del(key)
+	deleted := s1 > 0 || s2 > 0
+
+	if deleted && c.onEvicted != nil {
+		if n1 != nil && n1.v != nil {
+			c.onEvicted(key, n1.v)
+		} else if n2 != nil && n2.v != nil {
+			c.onEvicted(key, n2.v)
+		}
+	}
+
+	if deleted {
+		//c.expirations.Delete(key)
+	}
+
+	return deleted
+}
+
+func (c *lru2Cache) Delete(key string) bool {
+	idx := hashBKRD(key) & c.mask
+	c.locks[idx].Lock()
+	defer c.locks[idx].Unlock()
+
+	return c.delete(key, idx)
+}
+
+func (c *lru2Cache) Clear() {
+	var keys []string
+
+	for i := range c.caches {
+		c.locks[i].Lock()
+
+		c.caches[i][0].walk(func(key string, value Value, expireAt int64) bool {
+			keys = append(keys, key)
+			return true
+		})
+		c.caches[i][1].walk(func(key string, value Value, expireAt int64) bool {
+			// 检查键是否已经收集（避免重复）
+			for _, k := range keys {
+				if key == k {
+					return true
+				}
+			}
+			keys = append(keys, key)
+			return true
+		})
+
+		c.locks[i].Unlock()
+	}
+
+	for _, key := range keys {
+		c.Delete(key)
+	}
+
+	//c.expirations = sync.Map{}
+}
+
+func (c *lru2Cache) Len() (count int) {
+	for i := range c.caches {
+		c.locks[i].Lock()
+
+		c.caches[i][0].walk(func(key string, value Value, expireAt int64) bool {
+			count++
+			return true
+		})
+		c.caches[i][1].walk(func(key string, value Value, expireAt int64) bool {
+			count++
+			return true
+		})
+
+		c.locks[i].Unlock()
+	}
+
+	return
+}
+
+// Close 关闭缓存，停止清理协程
+func (c *lru2Cache) Close() {
+	if c.cleanupTicker != nil {
+		c.cleanupTicker.Stop()
+		close(c.closeCh)
+	}
+}
+
+// cleanupLoop 定期清理过期缓存的协程
+func (c *lru2Cache) cleanupLoop() {
+	for {
+		select {
+		case <-c.cleanupTicker.C:
+			currentTime := Now()
+
+			for i := range c.caches {
+				c.locks[i].Lock()
+
+				// 检查并清理过期项目
+				var expiredKeys []string
+
+				c.caches[i][0].walk(func(key string, value Value, expireAt int64) bool {
+					if expireAt > 0 && currentTime >= expireAt {
+						expiredKeys = append(expiredKeys, key)
+					}
+					return true
+				})
+
+				c.caches[i][1].walk(func(key string, value Value, expireAt int64) bool {
+					if expireAt > 0 && currentTime >= expireAt {
+						for _, k := range expiredKeys {
+							if key == k {
+								// 避免重复
+								return true
+							}
+						}
+						expiredKeys = append(expiredKeys, key)
+					}
+					return true
+				})
+
+				for _, key := range expiredKeys {
+					c.delete(key, int32(i))
+				}
+
+				c.locks[i].Unlock()
+			}
+		case <-c.closeCh:
+			return
+		}
+	}
 }
