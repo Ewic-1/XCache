@@ -1,12 +1,13 @@
 package xcache
 
 import (
-	"xcache/singleflight"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
+	"xcache/singleflight"
 
 	"github.com/sirupsen/logrus"
 )
@@ -121,7 +122,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption)
 	return g
 }
 
-func (g *Group) GetGroup(name string) *Group {
+func GetGroup(name string) *Group {
 	groupsMu.RLock()
 	defer groupsMu.RUnlock()
 	return groups[name]
@@ -138,6 +139,33 @@ func ListGroups() []string {
 	}
 
 	return names
+}
+
+// DestroyGroup 销毁指定名称的缓存组
+func DestroyGroup(name string) bool {
+	groupsMu.Lock()
+	defer groupsMu.Unlock()
+
+	if g, exists := groups[name]; exists {
+		g.Close()
+		delete(groups, name)
+		logrus.Infof("[XCache] destroyed cache group [%s]", name)
+		return true
+	}
+
+	return false
+}
+
+// DestroyAllGroups 销毁所有缓存组
+func DestroyAllGroups() {
+	groupsMu.Lock()
+	defer groupsMu.Unlock()
+
+	for name, g := range groups {
+		g.Close()
+		delete(groups, name)
+		logrus.Infof("[XCache] destroyed cache group [%s]", name)
+	}
 }
 
 // Get 从缓存中获取value
@@ -283,11 +311,70 @@ func (g *Group) Close() error {
 	return nil
 }
 
-func (g *Group) loadData(ctx context.Context, key string) (ByteView, error) {
-
-	return ByteView{}, nil
-}
-
 func (g *Group) syncToPeers(ctx context.Context, op string, key string, value []byte) {
 
+}
+
+// loadData 实际加载数据的方法
+func (g *Group) loadData(ctx context.Context, key string) (value ByteView, err error) {
+	// 尝试从远程节点获取
+	//if g.peers != nil {
+	//	peer, ok, isSelf := g.peers.PickPeer(key)
+	//	if ok && !isSelf {
+	//		value, err := g.getFromPeer(ctx, peer, key)
+	//		if err == nil {
+	//			atomic.AddInt64(&g.stats.peerHits, 1)
+	//			return value, nil
+	//		}
+	//
+	//		atomic.AddInt64(&g.stats.peerMisses, 1)
+	//		logrus.Warnf("[XCache] failed to get from peer: %v", err)
+	//	}
+	//}
+
+	// 从数据源加载
+	bytes, err := g.getter.Get(ctx, key)
+	if err != nil {
+		return ByteView{}, fmt.Errorf("failed to get data: %w", err)
+	}
+
+	atomic.AddInt64(&g.stats.loaderHits, 1)
+	return ByteView{b: cloneBytes(bytes)}, nil
+}
+
+// Stats 返回缓存统计信息
+func (g *Group) Stats() map[string]interface{} {
+	stats := map[string]interface{}{
+		"name":          g.name,
+		"closed":        atomic.LoadInt32(&g.closed) == 1,
+		"expiration":    g.expiration,
+		"loads":         atomic.LoadInt64(&g.stats.loads),
+		"local_hits":    atomic.LoadInt64(&g.stats.localHits),
+		"local_misses":  atomic.LoadInt64(&g.stats.localMisses),
+		"peer_hits":     atomic.LoadInt64(&g.stats.peerHits),
+		"peer_misses":   atomic.LoadInt64(&g.stats.peerMisses),
+		"loader_hits":   atomic.LoadInt64(&g.stats.loaderHits),
+		"loader_errors": atomic.LoadInt64(&g.stats.loaderErrors),
+	}
+
+	// 计算各种命中率
+	totalGets := stats["local_hits"].(int64) + stats["local_misses"].(int64)
+	if totalGets > 0 {
+		stats["hit_rate"] = float64(stats["local_hits"].(int64)) / float64(totalGets)
+	}
+
+	totalLoads := stats["loads"].(int64)
+	if totalLoads > 0 {
+		stats["avg_load_time_ms"] = float64(atomic.LoadInt64(&g.stats.loadDuration)) / float64(totalLoads) / float64(time.Millisecond)
+	}
+
+	// 添加缓存大小
+	if g.mainCache != nil {
+		cacheStats := g.mainCache.Stats()
+		for k, v := range cacheStats {
+			stats["cache_"+k] = v
+		}
+	}
+
+	return stats
 }

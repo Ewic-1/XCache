@@ -139,11 +139,7 @@ func (c *lruCache) Get(key string) (Value, bool) {
 	}
 	// 判断是否过期
 	t, hasEx := c.expires[key]
-	if !hasEx {
-		c.mu.RUnlock()
-		return nil, false
-	}
-	if time.Now().After(t) {
+	if hasEx && time.Now().After(t) {
 		c.mu.RUnlock()
 		// 异步删除过期项目，避免在读锁内操作
 		go c.Delete(key)
